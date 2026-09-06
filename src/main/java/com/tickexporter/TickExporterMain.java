@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Standalone JForex tick exporter.
  * Parameters (system properties or env):
- *   instrument   e.g. EURUSD
+ *   instrument   e.g. EURUSD , GASCMDUSD , XAUUSD
  *   from         yyyy-MM-dd or yyyy-MM-dd HH:mm  (UTC)
  *   to           yyyy-MM-dd or yyyy-MM-dd HH:mm  (UTC, exclusive)
  *   username / password  (or DUKASCOPY_USERNAME / DUKASCOPY_PASSWORD)
@@ -30,7 +30,7 @@ public class TickExporterMain {
 
     private static final Logger log = LoggerFactory.getLogger(TickExporterMain.class);
 
-    // DEMO JNLP (update only if Dukascopy changes the URL)
+    // DEMO JNLP
     private static final String JNLP_URL = "https://platform.dukascopy.com/demo_3/jforex_3.jnlp";
 
     // Optimized: larger chunks + less sleep
@@ -152,13 +152,30 @@ public class TickExporterMain {
             System.exit(1);
         }
 
+        // ========== Subscribe to instrument ==========
         Set<Instrument> instruments = new HashSet<>();
         instruments.add(instrument);
         client.setSubscribedInstruments(instruments);
-        // small wait so subscription is ready
-        Thread.sleep(3000);
 
-                long processId = client.startStrategy(new TickExportStrategy(instrument, from, to, csvFile, success));
+        log.info("Waiting for instrument {} to be subscribed...", instrument);
+        boolean subscribed = false;
+        for (int i = 1; i <= 20; i++) {
+            if (client.getSubscribedInstruments().contains(instrument)) {
+                subscribed = true;
+                log.info("Instrument subscribed successfully (after {} seconds)", i);
+                break;
+            }
+            Thread.sleep(1000);
+        }
+
+        if (!subscribed) {
+            log.error("Instrument {} was not subscribed after 20 seconds", instrument);
+            try { client.disconnect(); } catch (Exception ignored) {}
+            System.exit(1);
+        }
+        // ============================================
+
+        long processId = client.startStrategy(new TickExportStrategy(instrument, from, to, csvFile, success));
 
         // Wait for strategy to finish
         boolean completed = finished.await(5, TimeUnit.HOURS);
@@ -177,7 +194,7 @@ public class TickExporterMain {
         log.info("CSV ready: {} ({} bytes)", csvFile.getAbsolutePath(), csvFile.length());
         System.out.println("OUTPUT_CSV=" + csvFile.getAbsolutePath());
 
-        // disconnect را غیرمسدودکننده انجام بده
+        // disconnect non-blocking
         Thread disconnectThread = new Thread(() -> {
             try {
                 client.disconnect();
@@ -289,12 +306,21 @@ public class TickExporterMain {
     // ==================== helpers ====================
 
     private static Instrument parseInstrument(String s) {
-        String normalized = s.trim().toUpperCase().replace("/", "").replace("_", "");
+        String normalized = s.trim().toUpperCase().replace("/", "").replace("_", "").replace(".", "");
         try {
+            // اول سعی می‌کنیم با valueOf
             return Instrument.valueOf(normalized);
         } catch (Exception e) {
-            throw new IllegalArgumentException("Unknown instrument: " + s
-                    + " (use EURUSD, XAUUSD, GBPUSD, ...)", e);
+            // اگر نشد، از fromString استفاده می‌کنیم (برای CFDها مثل GAS.CMD/USD)
+            try {
+                // سعی با فرمت استاندارد
+                String withDot = normalized.replace("CMDUSD", ".CMD/USD")
+                                          .replace("CMDUSX", ".CMD/USX");
+                return Instrument.fromString(withDot);
+            } catch (Exception ex) {
+                throw new IllegalArgumentException("Unknown instrument: " + s
+                        + " (use EURUSD, XAUUSD, GASCMDUSD, LIGHTCMDUSD, ...)", ex);
+            }
         }
     }
 
