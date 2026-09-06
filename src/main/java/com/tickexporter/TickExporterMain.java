@@ -33,7 +33,6 @@ public class TickExporterMain {
     // DEMO JNLP
     private static final String JNLP_URL = "https://platform.dukascopy.com/demo_3/jforex_3.jnlp";
 
-    // Optimized: larger chunks + less sleep
     private static final long CHUNK_MS = 24L * 60 * 60 * 1000; // 24 hours
     private static final long SLEEP_BETWEEN_CHUNKS_MS = 50;
 
@@ -152,28 +151,8 @@ public class TickExporterMain {
             System.exit(1);
         }
 
-        // ========== Subscribe to instrument ==========
-        Set<Instrument> instruments = new HashSet<>();
-        instruments.add(instrument);
-        client.setSubscribedInstruments(instruments);
-
-        log.info("Waiting for instrument {} to be subscribed...", instrument);
-        boolean subscribed = false;
-        for (int i = 1; i <= 20; i++) {
-            if (client.getSubscribedInstruments().contains(instrument)) {
-                subscribed = true;
-                log.info("Instrument subscribed successfully (after {} seconds)", i);
-                break;
-            }
-            Thread.sleep(1000);
-        }
-
-        if (!subscribed) {
-            log.error("Instrument {} was not subscribed after 20 seconds", instrument);
-            try { client.disconnect(); } catch (Exception ignored) {}
-            System.exit(1);
-        }
-        // ============================================
+        // فقط یک صبر کوتاه بعد از اتصال
+        Thread.sleep(2000);
 
         long processId = client.startStrategy(new TickExportStrategy(instrument, from, to, csvFile, success));
 
@@ -194,7 +173,6 @@ public class TickExporterMain {
         log.info("CSV ready: {} ({} bytes)", csvFile.getAbsolutePath(), csvFile.length());
         System.out.println("OUTPUT_CSV=" + csvFile.getAbsolutePath());
 
-        // disconnect non-blocking
         Thread disconnectThread = new Thread(() -> {
             try {
                 client.disconnect();
@@ -234,12 +212,41 @@ public class TickExporterMain {
             history = context.getHistory();
             console = context.getConsole();
 
+            // ========== اشتراک اینسترومنت داخل استراتژی ==========
+            Set<Instrument> instruments = new HashSet<>();
+            instruments.add(instrument);
+            context.setSubscribedInstruments(instruments);
+
+            // صبر کردن تا واقعاً subscribe شود
+            console.getOut().println("Waiting for instrument subscription: " + instrument);
+            boolean subscribed = false;
+            for (int i = 1; i <= 30; i++) {
+                if (context.getSubscribedInstruments().contains(instrument)) {
+                    subscribed = true;
+                    console.getOut().println("Instrument subscribed after " + i + " seconds");
+                    break;
+                }
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+
+            if (!subscribed) {
+                console.getErr().println("ERROR: Instrument " + instrument + " was not subscribed");
+                success.set(false);
+                context.stop();
+                return;
+            }
+            // ====================================================
+
             PrintWriter out = null;
             try {
                 SimpleDateFormat fmt = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
                 fmt.setTimeZone(TimeZone.getTimeZone("GMT"));
 
-                // Buffered writer for much faster I/O
                 out = new PrintWriter(new BufferedWriter(new FileWriter(csvFile), 1024 * 1024), false);
                 out.println("GmtTime,Bid,Ask,BidVolume,AskVolume");
 
@@ -255,7 +262,6 @@ public class TickExporterMain {
 
                     for (ITick t : ticks) {
                         if (t.getTime() <= lastTickTime) continue;
-                        // exclusive end
                         if (t.getTime() >= to) continue;
                         lastTickTime = t.getTime();
 
@@ -306,17 +312,25 @@ public class TickExporterMain {
     // ==================== helpers ====================
 
     private static Instrument parseInstrument(String s) {
-        String normalized = s.trim().toUpperCase().replace("/", "").replace("_", "").replace(".", "");
+        String normalized = s.trim().toUpperCase()
+                .replace("/", "")
+                .replace("_", "")
+                .replace(".", "");
+
         try {
-            // اول سعی می‌کنیم با valueOf
             return Instrument.valueOf(normalized);
         } catch (Exception e) {
-            // اگر نشد، از fromString استفاده می‌کنیم (برای CFDها مثل GAS.CMD/USD)
             try {
-                // سعی با فرمت استاندارد
-                String withDot = normalized.replace("CMDUSD", ".CMD/USD")
-                                          .replace("CMDUSX", ".CMD/USX");
-                return Instrument.fromString(withDot);
+                // برای CFDها مثل GASCMDUSD → GAS.CMD/USD
+                if (normalized.endsWith("CMDUSD")) {
+                    String base = normalized.substring(0, normalized.length() - 6);
+                    return Instrument.fromString(base + ".CMD/USD");
+                }
+                if (normalized.endsWith("CMDUSX")) {
+                    String base = normalized.substring(0, normalized.length() - 6);
+                    return Instrument.fromString(base + ".CMD/USX");
+                }
+                return Instrument.fromString(normalized);
             } catch (Exception ex) {
                 throw new IllegalArgumentException("Unknown instrument: " + s
                         + " (use EURUSD, XAUUSD, GASCMDUSD, LIGHTCMDUSD, ...)", ex);
