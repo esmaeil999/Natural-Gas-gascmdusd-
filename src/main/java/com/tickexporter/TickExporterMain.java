@@ -17,15 +17,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * Standalone JForex tick exporter.
- */
 public class TickExporterMain {
 
     private static final Logger log = LoggerFactory.getLogger(TickExporterMain.class);
-
     private static final String JNLP_URL = "https://platform.dukascopy.com/demo_3/jforex_3.jnlp";
-    private static final long CHUNK_MS = 24L * 60 * 60 * 1000; // 24 hours
+    private static final long CHUNK_MS = 24L * 60 * 60 * 1000;
     private static final long SLEEP_BETWEEN_CHUNKS_MS = 50;
 
     public static void main(String[] args) throws Exception {
@@ -77,9 +73,6 @@ public class TickExporterMain {
         log.info("From (UTC) : {}", formatUtc(from));
         log.info("To   (UTC) : {} (exclusive)", formatUtc(to));
         log.info("Approx days: {}", days);
-        if (days > 400) {
-            log.warn("Range is larger than ~1 year. This may exceed GitHub Actions time/disk limits.");
-        }
 
         File outDir = new File(outputDir);
         if (!outDir.exists() && !outDir.mkdirs()) {
@@ -143,9 +136,14 @@ public class TickExporterMain {
             System.exit(1);
         }
 
-        Thread.sleep(2000);
+        // Subscribe on client side as well
+        Set<Instrument> clientInstruments = new HashSet<>();
+        clientInstruments.add(instrument);
+        client.setSubscribedInstruments(clientInstruments);
+        Thread.sleep(3000);
 
-        long processId = client.startStrategy(new TickExportStrategy(instrument, from, to, csvFile, success));
+        long processId = client.startStrategy(
+                new TickExportStrategy(instrument, from, to, csvFile, success));
 
         boolean completed = finished.await(5, TimeUnit.HOURS);
         if (!completed) {
@@ -177,8 +175,6 @@ public class TickExporterMain {
         System.exit(0);
     }
 
-    // ==================== Strategy ====================
-
     static class TickExportStrategy implements IStrategy {
         private final Instrument instrument;
         private final long from;
@@ -189,7 +185,8 @@ public class TickExporterMain {
         private IHistory history;
         private IConsole console;
 
-        TickExportStrategy(Instrument instrument, long from, long to, File csvFile, AtomicBoolean success) {
+        TickExportStrategy(Instrument instrument, long from, long to,
+                           File csvFile, AtomicBoolean success) {
             this.instrument = instrument;
             this.from = from;
             this.to = to;
@@ -202,15 +199,16 @@ public class TickExporterMain {
             history = context.getHistory();
             console = context.getConsole();
 
-            // اشتراک اولیه
-            Set<Instrument> instruments = new HashSet<>();
-            instruments.add(instrument);
-            context.setSubscribedInstruments(instruments);
+            // Subscribe inside strategy context
+            Set<Instrument> subscribedSet = new HashSet<>();
+            subscribedSet.add(instrument);
+            context.setSubscribedInstruments(subscribedSet);
 
             console.getOut().println("Waiting for instrument subscription: " + instrument);
             boolean subscribed = false;
             for (int i = 1; i <= 30; i++) {
-                if (context.getSubscribedInstruments().contains(instrument)) {
+                Set<Instrument> current = context.getSubscribedInstruments();
+                if (current != null && current.contains(instrument)) {
                     subscribed = true;
                     console.getOut().println("Instrument subscribed after " + i + " seconds");
                     break;
@@ -244,15 +242,9 @@ public class TickExporterMain {
                 long startMs = System.currentTimeMillis();
 
                 while (cursor < to) {
-                    // تضمین اشتراک قبل از هر چانک (بدون تعریف دوباره متغیر)
-                    context.setSubscribedInstruments(instruments);
-                    Thread.sleep(1500);
-
-                    if (!context.getSubscribedInstruments().contains(instrument)) {
-                        console.getOut().println("Re-subscribing...");
-                        context.setSubscribedInstruments(instruments);
-                        Thread.sleep(2000);
-                    }
+                    // Re-ensure subscription before every chunk
+                    context.setSubscribedInstruments(subscribedSet);
+                    Thread.sleep(1000);
 
                     long chunkEnd = Math.min(cursor + CHUNK_MS, to);
 
@@ -261,8 +253,8 @@ public class TickExporterMain {
                         ticks = history.getTicks(instrument, cursor, chunkEnd);
                     } catch (JFException e) {
                         if (e.getMessage() != null && e.getMessage().contains("not subscribed")) {
-                            console.getOut().println("Got 'not subscribed' - retrying after re-subscribe...");
-                            context.setSubscribedInstruments(instruments);
+                            console.getOut().println("Got 'not subscribed' - retrying...");
+                            context.setSubscribedInstruments(subscribedSet);
                             Thread.sleep(3000);
                             ticks = history.getTicks(instrument, cursor, chunkEnd);
                         } else {
@@ -296,7 +288,6 @@ public class TickExporterMain {
                 }
 
                 out.flush();
-
                 console.getOut().println("FINISHED. total ticks = " + total);
                 log.info("FINISHED. total ticks = {}", total);
                 success.set(true);
@@ -318,8 +309,6 @@ public class TickExporterMain {
         @Override public void onAccount(IAccount account) {}
         @Override public void onStop() {}
     }
-
-    // ==================== helpers ====================
 
     private static Instrument parseInstrument(String s) {
         String normalized = s.trim().toUpperCase()
