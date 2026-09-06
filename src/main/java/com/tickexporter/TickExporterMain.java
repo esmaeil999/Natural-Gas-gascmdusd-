@@ -242,64 +242,91 @@ public class TickExporterMain {
             }
             // ====================================================
 
-            PrintWriter out = null;
-            try {
-                SimpleDateFormat fmt = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
-                fmt.setTimeZone(TimeZone.getTimeZone("GMT"));
+PrintWriter out = null;
+try {
+    SimpleDateFormat fmt = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+    fmt.setTimeZone(TimeZone.getTimeZone("GMT"));
 
-                out = new PrintWriter(new BufferedWriter(new FileWriter(csvFile), 1024 * 1024), false);
-                out.println("GmtTime,Bid,Ask,BidVolume,AskVolume");
+    out = new PrintWriter(new BufferedWriter(new FileWriter(csvFile), 1024 * 1024), false);
+    out.println("GmtTime,Bid,Ask,BidVolume,AskVolume");
 
-                long cursor = from;
-                long lastTickTime = -1;
-                long total = 0;
-                long startMs = System.currentTimeMillis();
+    long cursor = from;
+    long lastTickTime = -1;
+    long total = 0;
+    long startMs = System.currentTimeMillis();
 
-                while (cursor < to) {
-                    long chunkEnd = Math.min(cursor + CHUNK_MS, to);
+    while (cursor < to) {
+        // ========== تضمین اشتراک قبل از هر چانک ==========
+        Set<Instrument> instruments = new HashSet<>();
+        instruments.add(instrument);
+        context.setSubscribedInstruments(instruments);
 
-                    List<ITick> ticks = history.getTicks(instrument, cursor, chunkEnd);
+        // صبر کوتاه برای تثبیت اشتراک
+        Thread.sleep(1500);
 
-                    for (ITick t : ticks) {
-                        if (t.getTime() <= lastTickTime) continue;
-                        if (t.getTime() >= to) continue;
-                        lastTickTime = t.getTime();
+        if (!context.getSubscribedInstruments().contains(instrument)) {
+            console.getOut().println("Re-subscribing...");
+            context.setSubscribedInstruments(instruments);
+            Thread.sleep(2000);
+        }
+        // =================================================
 
-                        out.println(fmt.format(new Date(t.getTime())) + ","
-                                + t.getBid() + ","
-                                + t.getAsk() + ","
-                                + t.getBidVolume() + ","
-                                + t.getAskVolume());
-                        total++;
-                    }
+        long chunkEnd = Math.min(cursor + CHUNK_MS, to);
 
-                    long elapsedSec = (System.currentTimeMillis() - startMs) / 1000;
-                    String msg = String.format("chunk %s | ticks=%d | total=%d | elapsed=%ds",
-                            fmt.format(new Date(chunkEnd)), ticks.size(), total, elapsedSec);
-                    console.getOut().println(msg);
-                    log.info(msg);
-
-                    cursor = chunkEnd;
-                    if (SLEEP_BETWEEN_CHUNKS_MS > 0) {
-                        Thread.sleep(SLEEP_BETWEEN_CHUNKS_MS);
-                    }
-                }
-
-                out.flush();
-
-                console.getOut().println("FINISHED. total ticks = " + total);
-                log.info("FINISHED. total ticks = {}", total);
-                success.set(true);
-
-            } catch (Exception e) {
-                console.getErr().println("Error: " + e);
-                log.error("Export error", e);
-                success.set(false);
-            } finally {
-                if (out != null) out.close();
+        List<ITick> ticks;
+        try {
+            ticks = history.getTicks(instrument, cursor, chunkEnd);
+        } catch (JFException e) {
+            if (e.getMessage() != null && e.getMessage().contains("not subscribed")) {
+                console.getOut().println("Got 'not subscribed' - retrying after re-subscribe...");
+                context.setSubscribedInstruments(instruments);
+                Thread.sleep(3000);
+                ticks = history.getTicks(instrument, cursor, chunkEnd); // یک بار دیگر تلاش
+            } else {
+                throw e;
             }
+        }
 
-            context.stop();
+        for (ITick t : ticks) {
+            if (t.getTime() <= lastTickTime) continue;
+            if (t.getTime() >= to) continue;
+            lastTickTime = t.getTime();
+
+            out.println(fmt.format(new Date(t.getTime())) + ","
+                    + t.getBid() + ","
+                    + t.getAsk() + ","
+                    + t.getBidVolume() + ","
+                    + t.getAskVolume());
+            total++;
+        }
+
+        long elapsedSec = (System.currentTimeMillis() - startMs) / 1000;
+        String msg = String.format("chunk %s | ticks=%d | total=%d | elapsed=%ds",
+                fmt.format(new Date(chunkEnd)), ticks.size(), total, elapsedSec);
+        console.getOut().println(msg);
+        log.info(msg);
+
+        cursor = chunkEnd;
+        if (SLEEP_BETWEEN_CHUNKS_MS > 0) {
+            Thread.sleep(SLEEP_BETWEEN_CHUNKS_MS);
+        }
+    }
+
+    out.flush();
+
+    console.getOut().println("FINISHED. total ticks = " + total);
+    log.info("FINISHED. total ticks = {}", total);
+    success.set(true);
+
+} catch (Exception e) {
+    console.getErr().println("Error: " + e);
+    log.error("Export error", e);
+    success.set(false);
+} finally {
+    if (out != null) out.close();
+}
+
+context.stop();
         }
 
         @Override public void onTick(Instrument instrument, ITick tick) {}
