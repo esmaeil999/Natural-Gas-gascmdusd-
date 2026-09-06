@@ -19,20 +19,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Standalone JForex tick exporter.
- * Parameters (system properties or env):
- *   instrument   e.g. EURUSD , GASCMDUSD , XAUUSD
- *   from         yyyy-MM-dd or yyyy-MM-dd HH:mm  (UTC)
- *   to           yyyy-MM-dd or yyyy-MM-dd HH:mm  (UTC, exclusive)
- *   username / password  (or DUKASCOPY_USERNAME / DUKASCOPY_PASSWORD)
- *   outputDir    default: ./output
  */
 public class TickExporterMain {
 
     private static final Logger log = LoggerFactory.getLogger(TickExporterMain.class);
 
-    // DEMO JNLP
     private static final String JNLP_URL = "https://platform.dukascopy.com/demo_3/jforex_3.jnlp";
-
     private static final long CHUNK_MS = 24L * 60 * 60 * 1000; // 24 hours
     private static final long SLEEP_BETWEEN_CHUNKS_MS = 50;
 
@@ -151,12 +143,10 @@ public class TickExporterMain {
             System.exit(1);
         }
 
-        // فقط یک صبر کوتاه بعد از اتصال
         Thread.sleep(2000);
 
         long processId = client.startStrategy(new TickExportStrategy(instrument, from, to, csvFile, success));
 
-        // Wait for strategy to finish
         boolean completed = finished.await(5, TimeUnit.HOURS);
         if (!completed) {
             log.error("Timed out waiting for export to finish");
@@ -212,12 +202,11 @@ public class TickExporterMain {
             history = context.getHistory();
             console = context.getConsole();
 
-            // ========== اشتراک اینسترومنت داخل استراتژی ==========
+            // اشتراک اولیه
             Set<Instrument> instruments = new HashSet<>();
             instruments.add(instrument);
             context.setSubscribedInstruments(instruments);
 
-            // صبر کردن تا واقعاً subscribe شود
             console.getOut().println("Waiting for instrument subscription: " + instrument);
             boolean subscribed = false;
             for (int i = 1; i <= 30; i++) {
@@ -240,93 +229,87 @@ public class TickExporterMain {
                 context.stop();
                 return;
             }
-            // ====================================================
 
-PrintWriter out = null;
-try {
-    SimpleDateFormat fmt = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
-    fmt.setTimeZone(TimeZone.getTimeZone("GMT"));
+            PrintWriter out = null;
+            try {
+                SimpleDateFormat fmt = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+                fmt.setTimeZone(TimeZone.getTimeZone("GMT"));
 
-    out = new PrintWriter(new BufferedWriter(new FileWriter(csvFile), 1024 * 1024), false);
-    out.println("GmtTime,Bid,Ask,BidVolume,AskVolume");
+                out = new PrintWriter(new BufferedWriter(new FileWriter(csvFile), 1024 * 1024), false);
+                out.println("GmtTime,Bid,Ask,BidVolume,AskVolume");
 
-    long cursor = from;
-    long lastTickTime = -1;
-    long total = 0;
-    long startMs = System.currentTimeMillis();
+                long cursor = from;
+                long lastTickTime = -1;
+                long total = 0;
+                long startMs = System.currentTimeMillis();
 
-    while (cursor < to) {
-        // ========== تضمین اشتراک قبل از هر چانک ==========
-        Set<Instrument> instruments = new HashSet<>();
-        instruments.add(instrument);
-        context.setSubscribedInstruments(instruments);
+                while (cursor < to) {
+                    // تضمین اشتراک قبل از هر چانک (بدون تعریف دوباره متغیر)
+                    context.setSubscribedInstruments(instruments);
+                    Thread.sleep(1500);
 
-        // صبر کوتاه برای تثبیت اشتراک
-        Thread.sleep(1500);
+                    if (!context.getSubscribedInstruments().contains(instrument)) {
+                        console.getOut().println("Re-subscribing...");
+                        context.setSubscribedInstruments(instruments);
+                        Thread.sleep(2000);
+                    }
 
-        if (!context.getSubscribedInstruments().contains(instrument)) {
-            console.getOut().println("Re-subscribing...");
-            context.setSubscribedInstruments(instruments);
-            Thread.sleep(2000);
-        }
-        // =================================================
+                    long chunkEnd = Math.min(cursor + CHUNK_MS, to);
 
-        long chunkEnd = Math.min(cursor + CHUNK_MS, to);
+                    List<ITick> ticks;
+                    try {
+                        ticks = history.getTicks(instrument, cursor, chunkEnd);
+                    } catch (JFException e) {
+                        if (e.getMessage() != null && e.getMessage().contains("not subscribed")) {
+                            console.getOut().println("Got 'not subscribed' - retrying after re-subscribe...");
+                            context.setSubscribedInstruments(instruments);
+                            Thread.sleep(3000);
+                            ticks = history.getTicks(instrument, cursor, chunkEnd);
+                        } else {
+                            throw e;
+                        }
+                    }
 
-        List<ITick> ticks;
-        try {
-            ticks = history.getTicks(instrument, cursor, chunkEnd);
-        } catch (JFException e) {
-            if (e.getMessage() != null && e.getMessage().contains("not subscribed")) {
-                console.getOut().println("Got 'not subscribed' - retrying after re-subscribe...");
-                context.setSubscribedInstruments(instruments);
-                Thread.sleep(3000);
-                ticks = history.getTicks(instrument, cursor, chunkEnd); // یک بار دیگر تلاش
-            } else {
-                throw e;
+                    for (ITick t : ticks) {
+                        if (t.getTime() <= lastTickTime) continue;
+                        if (t.getTime() >= to) continue;
+                        lastTickTime = t.getTime();
+
+                        out.println(fmt.format(new Date(t.getTime())) + ","
+                                + t.getBid() + ","
+                                + t.getAsk() + ","
+                                + t.getBidVolume() + ","
+                                + t.getAskVolume());
+                        total++;
+                    }
+
+                    long elapsedSec = (System.currentTimeMillis() - startMs) / 1000;
+                    String msg = String.format("chunk %s | ticks=%d | total=%d | elapsed=%ds",
+                            fmt.format(new Date(chunkEnd)), ticks.size(), total, elapsedSec);
+                    console.getOut().println(msg);
+                    log.info(msg);
+
+                    cursor = chunkEnd;
+                    if (SLEEP_BETWEEN_CHUNKS_MS > 0) {
+                        Thread.sleep(SLEEP_BETWEEN_CHUNKS_MS);
+                    }
+                }
+
+                out.flush();
+
+                console.getOut().println("FINISHED. total ticks = " + total);
+                log.info("FINISHED. total ticks = {}", total);
+                success.set(true);
+
+            } catch (Exception e) {
+                console.getErr().println("Error: " + e);
+                log.error("Export error", e);
+                success.set(false);
+            } finally {
+                if (out != null) out.close();
             }
-        }
 
-        for (ITick t : ticks) {
-            if (t.getTime() <= lastTickTime) continue;
-            if (t.getTime() >= to) continue;
-            lastTickTime = t.getTime();
-
-            out.println(fmt.format(new Date(t.getTime())) + ","
-                    + t.getBid() + ","
-                    + t.getAsk() + ","
-                    + t.getBidVolume() + ","
-                    + t.getAskVolume());
-            total++;
-        }
-
-        long elapsedSec = (System.currentTimeMillis() - startMs) / 1000;
-        String msg = String.format("chunk %s | ticks=%d | total=%d | elapsed=%ds",
-                fmt.format(new Date(chunkEnd)), ticks.size(), total, elapsedSec);
-        console.getOut().println(msg);
-        log.info(msg);
-
-        cursor = chunkEnd;
-        if (SLEEP_BETWEEN_CHUNKS_MS > 0) {
-            Thread.sleep(SLEEP_BETWEEN_CHUNKS_MS);
-        }
-    }
-
-    out.flush();
-
-    console.getOut().println("FINISHED. total ticks = " + total);
-    log.info("FINISHED. total ticks = {}", total);
-    success.set(true);
-
-} catch (Exception e) {
-    console.getErr().println("Error: " + e);
-    log.error("Export error", e);
-    success.set(false);
-} finally {
-    if (out != null) out.close();
-}
-
-context.stop();
+            context.stop();
         }
 
         @Override public void onTick(Instrument instrument, ITick tick) {}
@@ -348,7 +331,6 @@ context.stop();
             return Instrument.valueOf(normalized);
         } catch (Exception e) {
             try {
-                // برای CFDها مثل GASCMDUSD → GAS.CMD/USD
                 if (normalized.endsWith("CMDUSD")) {
                     String base = normalized.substring(0, normalized.length() - 6);
                     return Instrument.fromString(base + ".CMD/USD");
